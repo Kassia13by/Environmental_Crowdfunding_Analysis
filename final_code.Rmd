@@ -1,0 +1,699 @@
+---
+title: "An Analysis of Persuasive Strategies Used in Environmental Crowdfunding"
+author: "Biao Yun, Ying-Pei, Yu, Hao-Yun Chuang"
+date: "2022/01/16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Library
+```{r message=FALSE, warning=FALSE}
+library(tm)
+library(dplyr)
+library(tidyr)
+library(tokenizers)
+library(tidyverse)
+library(caret)
+library(proxy)
+library(qdapRegex)
+library(tidytext)
+library(e1071)
+library(caTools)
+library(randomForest)
+library(glmnet)
+library(text2vec)
+library(rpart)
+library(rpart.plot)
+```
+
+## Preprocess
+```{r}
+library(cld3)
+data = read.csv(file = "kickstarter.csv", sep = ",", encoding="UTF-8")
+data = data[-c(11, 39, 41, 54, 74, 163, 170, 261, 285, 299, 313, 325, 379, 406, 445, 542, 556, 570, 107, 90, 101, 102, 111, 149, 216, 241, 287, 502), ]
+data = data[which(detect_language(data$story)=="en"), ]
+
+data$story = gsub("\n", " ", data$story, perl = T)
+data$story = rm_url(data$story)
+data = subset(data[which(data$state!="CANCELED"),])
+data = subset(data[which(data$state!="LIVE"),])
+data$state = as.factor(data$state)
+data$environmentalCommitments = as.factor(data$environmentalCommitments)
+data = data[complete.cases(data), ]
+```
+
+## Sentiment Analysis
+```{r}
+sentiment_words = as.data.frame(get_sentiments("bing"))
+positive = subset(sentiment_words, sentiment == "positive")
+positive_words = positive$word
+negative = subset(sentiment_words, sentiment == "negative")
+negative_words = negative$word
+negative_words = negative_words[-grep("[^a-z0-9 ]", negative_words, perl = T)]
+dataLen = length(data$X)
+
+search_positive = function(text){
+  token = unlist(tokenize_words(text))
+  search = token %in% positive_words
+  return(length(which(search == "TRUE")))
+}
+
+search_negative = function(text){
+  token = unlist(tokenize_words(text))
+  search = token %in% negative_words
+  return(length(which(search == "TRUE")))
+}
+
+sentiment = rep(c(""), dataLen)
+cbind(data, sentiment)
+for(i in 1:dataLen){
+  data$sentiment[i] = search_positive(data$story[i])-search_negative(data$story[i])
+}
+
+positive = rep(c(""), dataLen)
+cbind(data, positive)
+for(i in 1:dataLen){
+  data$positive[i] = search_positive(data$story[i])
+}
+
+negative = rep(c(""), dataLen)
+cbind(data, negative)
+for(i in 1:dataLen){
+  data$negative[i] = search_negative(data$story[i])
+}
+```
+
+## Pronoun
+```{r}
+first_person_singular = c("I", "me", "mine", "myself")
+first_person_plural = c("we", "us", "our", "ours", "ourselves")
+second_person = c("you", "your", "yours", "yourself", "yourselves")
+
+search_first_singular = function(text){
+  token = unlist(tokenize_words(text))
+  search = token %in% first_person_singular
+  return(length(which(search == "TRUE")))
+}
+
+search_first_plural = function(text){
+  token = unlist(tokenize_words(text))
+  search = token %in% first_person_plural
+  return(length(which(search == "TRUE")))
+}
+
+search_second = function(text){
+  token = unlist(tokenize_words(text))
+  search = token %in% second_person
+  return(length(which(search == "TRUE")))
+}
+
+first_singular = rep(c(""), dataLen)
+cbind(data, first_singular)
+for(i in 1:dataLen){
+  data$first_singular[i] = search_first_singular(data$story[i])
+}
+
+first_plural = rep(c(""), dataLen)
+cbind(data, first_plural)
+for(i in 1:dataLen){
+  data$first_plural[i] = search_first_plural(data$story[i])
+}
+
+second = rep(c(""), dataLen)
+cbind(data, second)
+for(i in 1:dataLen){
+  data$second[i] = search_second(data$story[i])
+}
+```
+
+## TF & TF-IDF
+```{r}
+corpus = Corpus(VectorSource(data$story))
+
+dtm_tf = DocumentTermMatrix(corpus,
+                            control = list(stopwords = stopwords(), 
+                                           removePunctuation = T,
+                                           removeNumbers = T,
+                                           stemming = T))
+
+dtm_tfidf = DocumentTermMatrix(corpus,
+                               control = list(weighting = weightTfIdf,
+                                              stopwords = stopwords(), 
+                                              removePunctuation = T,
+                                              removeNumbers = T,
+                                              stemming = T))
+dtm_tf = removeSparseTerms(dtm_tf, 0.8)
+dtm_tfidf = removeSparseTerms(dtm_tfidf, 0.8)
+feature_tf = cbind(data, data.frame(as.matrix(dtm_tf)))
+feature_tfidf = cbind(data, data.frame(as.matrix(dtm_tfidf)))
+data_tf = subset(feature_tf, select = -c(sentiment, positive, negative, first_singular, first_plural, second))
+data_tfidf = subset(feature_tfidf, select = -c(sentiment, positive, negative, first_singular, first_plural, second))
+```
+
+```{r}
+undersampling <- function(df){
+  success_cases = df[which(df$state == "SUCCESSFUL"), ]
+  failed_cases = df[which(df$state == "FAILED"), ]
+  success_sample = success_cases[sample(1:nrow(success_cases), 81),]
+  df = rbind(success_sample, failed_cases)
+  return(df)
+}
+labeler <- function(df){
+  for(i in seq_along(df$state)){
+    if (df$state[i] == "SUCCESSFUL"){
+      df$label[i] = 1
+    }else{
+      df$label[i] = 0
+    }
+  }
+  for(i in seq_along(df$environmentalCommitments)){
+    if (df$environmentalCommitments[i] == "True"){
+      df$label_env[i] = 1
+    }else{
+      df$label_env[i] = 0
+    }
+  }
+  return(df)
+}
+```
+
+## splitting the data
+```{R}
+set.seed(168)
+feature_tf = subset(feature_tf, select = -c(X, id, typename, currency, isSharingProjectBudget,  
+risks, story))
+feature_tf = undersampling(feature_tf)
+feature_tf_trainIndex = createDataPartition(feature_tf$state, p=0.8, list=FALSE)
+feature_tf_train_set = feature_tf[feature_tf_trainIndex, ]
+feature_tf_test_set = feature_tf[-feature_tf_trainIndex, ]
+```
+
+```{R}
+set.seed(168)
+feature_tfidf = subset(feature_tfidf, select = -c(X, id, typename, currency, isSharingProjectBudget,  
+risks, story))
+feature_tfidf = undersampling(feature_tfidf)
+feature_tfidf_trainIndex = createDataPartition(feature_tfidf$state, p=0.8, list=FALSE)
+feature_tfidf_train_set = feature_tfidf[feature_tfidf_trainIndex, ]
+feature_tfidf_test_set = feature_tfidf[-feature_tfidf_trainIndex, ]
+```
+
+```{R}
+set.seed(168)
+feature = subset(data, select = -c(X, id, typename, currency, isSharingProjectBudget,  
+risks, story))
+feature = undersampling(feature)
+trainIndex = createDataPartition(feature$state, p=0.8, list=FALSE)
+train_set = feature[trainIndex, ]
+test_set = feature[-trainIndex, ]
+```
+
+```{R}
+data_tf = subset(data_tf, select = -c(X, id, typename, currency, isSharingProjectBudget,  
+risks, story))
+data_tf = undersampling(data_tf)
+trainIndex_tf = createDataPartition(data_tf$state, p=0.8, list=FALSE)
+train_set_tf = data_tf[trainIndex_tf, ]
+test_set_tf = data_tf[-trainIndex_tf, ]
+```
+
+```{r}
+data_tfidf = subset(data_tfidf, select = -c(X, id, typename, currency, isSharingProjectBudget,  
+risks, story))
+data_tfidf = undersampling(data_tfidf)
+trainIndex_tfidf = createDataPartition(data_tfidf$state, p=0.8, list=FALSE)
+train_set_tfidf = data_tfidf[trainIndex_tfidf, ]
+test_set_tfidf = data_tfidf[-trainIndex_tfidf, ]
+```
+
+## Decision tree
+```{r}
+trained_model <- rpart(state~., data = train_set, method = 'class')
+#rpart.plot(trained_model, extra= 104) 
+
+predict_labels <- predict(trained_model, test_set, type = 'class')
+
+# Result + F score
+
+table_matrix <- confusionMatrix(predict_labels, test_set$state, mode='prec_recall')
+table_matrix
+
+# ---------------------------------- #
+trained_model_tf <- rpart(state~., data = train_set_tf, method = 'class')
+#rpart.plot(trained_model_tf, extra= 104) 
+
+predict_labels_tf <- predict(trained_model_tf, test_set_tf, type = 'class')
+
+# Result + F score
+
+table_matrix_tf <- confusionMatrix(predict_labels_tf, test_set_tf$state, mode='prec_recall')
+table_matrix_tf
+
+# ---------------------------------- #
+trained_model_tfidf <- rpart(state~., data = train_set_tfidf, method = 'class')
+#rpart.plot(trained_model_tfidf, extra= 104) 
+
+predict_labels_tfidf <- predict(trained_model_tfidf, test_set_tfidf, type = 'class')
+
+# Result + F score
+
+table_matrix_tfidf <- confusionMatrix(predict_labels_tfidf, test_set_tfidf$state, mode='prec_recall')
+table_matrix_tfidf
+
+# ---------------------------------- #
+trained_model_feature_tf <- rpart(state~., data = feature_tf_train_set, method = 'class')
+#rpart.plot(trained_model_feature_tf, extra= 104) 
+
+predict_labels_tf<- predict(trained_model_feature_tf, feature_tf_test_set, type = 'class')
+
+# Result + F score
+
+table_matrix <- confusionMatrix(predict_labels_tf, feature_tf_test_set$state, mode='prec_recall')
+table_matrix
+
+# ---------------------------------- #
+trained_model_feature_tfidf <- rpart(state~., data = feature_tfidf_train_set, method = 'class')
+#rpart.plot(trained_model_feature_tfidf, extra= 104) 
+
+predict_labels_tfidf <- predict(trained_model_feature_tfidf, feature_tfidf_test_set, type = 'class')
+
+# Result + F score
+
+table_matrix <- confusionMatrix(predict_labels_tfidf, feature_tfidf_test_set$state, mode='prec_recall')
+table_matrix
+```
+
+## Decision Tree 10-fold Cross Validation
+```{r}
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+feature_DT_model<- train(state~., data=feature, trControl=train_control, method="rpart")
+print(feature_DT_model)
+feature_DT_model<- train(state~., data=feature, method="rpart", cp = 0.2592593)
+feature_DT_pred = predict(feature_DT_model, test_set)
+confusionMatrix(feature_DT_pred, as.factor(test_set$state), mode='prec_recall')
+
+
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+tf_DT_model<- train(state~., data=data_tf, trControl=train_control, method="rpart")
+print(tf_DT_model)
+tf_DT_model<- train(state~., data=data_tf, method="rpart", cp = 0.08641975)
+tf_DT_pred = predict(tf_DT_model, test_set_tf)
+confusionMatrix(tf_DT_pred, as.factor(test_set_tf$state), mode='prec_recall')
+
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+tfidf_DT_model<- train(state~., data=data_tfidf, trControl=train_control, method="rpart")
+print(tfidf_DT_model)
+tfidf_DT_model<- train(state~., data=data_tfidf, method="rpart", cp = 0.09876543)
+tfidf_DT_pred = predict(tfidf_DT_model, test_set_tfidf)
+confusionMatrix(tfidf_DT_pred, as.factor(test_set_tfidf$state), mode='prec_recall')
+
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+feature_tf_DT_model<- train(state~., data=feature_tf, trControl=train_control, method="rpart")
+print(feature_tf_DT_model)
+feature_tf_DT_model<- train(state~., data=feature_tf, method="rpart", cp = 0.07407407)
+feature_tf_DT_pred = predict(feature_tf_DT_model, feature_tf_test_set)
+confusionMatrix(feature_tf_DT_pred, as.factor(feature_tf_test_set$state), mode='prec_recall')
+
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+feature_tfidf_DT_model<- train(state~., data=feature_tfidf, trControl=train_control, method="rpart")
+print(feature_tfidf_DT_model)
+feature_tfidf_DT_model<- train(state~., data=feature_tfidf, method="rpart", cp = 0.07407407)
+feature_tfidf_DT_pred = predict(feature_tfidf_DT_model, feature_tfidf_test_set)
+confusionMatrix(feature_tfidf_DT_pred, as.factor(feature_tfidf_test_set$state), mode='prec_recall')
+```
+
+## Naive Bayes
+```{r}
+Grid = data.frame(usekernel = TRUE, laplace = 0, adjust = 1)
+
+NB_feature = train(state ~ ., data = train_set, method = "naive_bayes",
+trControl= trainControl(method = "none"),
+tuneGrid = Grid)
+
+NB_tf = train(state ~ ., data = train_set_tf, method = "naive_bayes",
+trControl= trainControl(method = "none"),
+tuneGrid = Grid)
+
+NB_tfidf = train(state ~ ., data = train_set_tfidf, method = "naive_bayes",
+trControl= trainControl(method = "none"),
+tuneGrid = Grid)
+
+NB_feature_tf = train(state ~ ., data = feature_tf_test_set, method = "naive_bayes",
+trControl= trainControl(method = "none"),
+tuneGrid = Grid)
+
+NB_feature_tfidf = train(state ~ ., data = feature_tfidf_test_set, method = "naive_bayes",
+trControl= trainControl(method = "none"),
+tuneGrid = Grid)
+```
+
+```{R}
+y_NBpred <- predict(NB_feature, newdata = test_set)
+y_NBpred_tf <- predict(NB_tf, newdata = test_set_tf)
+y_NBpred_tfidf <- predict(NB_tfidf, newdata = test_set_tfidf)
+y_NBpred_feature_tf <- predict(NB_feature_tf, newdata = feature_tf_test_set)
+y_NBpred_feature_tfidf <- predict(NB_feature_tfidf, newdata = feature_tfidf_test_set)
+
+# Confusion Matrix
+cm <- table(test_set$state, y_NBpred)
+cm_tf <- table(test_set_tf$state, y_NBpred_tf)
+cm_tfidf <- table(test_set_tfidf$state, y_NBpred_tfidf)
+cm_feature_tf <- table(feature_tf_test_set$state, y_NBpred_feature_tf)
+cm_feature_tfidf <- table(feature_tfidf_test_set$state, y_NBpred_feature_tfidf)
+
+
+# Model Evaluation
+confusionMatrix(cm)
+confusionMatrix(cm_tf)
+confusionMatrix(cm_tfidf)
+confusionMatrix(cm_feature_tf)
+confusionMatrix(cm_feature_tfidf)
+```
+
+## Naive Bayes 10-fold Cross Validation
+```{r}
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+feature_NB_model<- train(state~., data=feature, trControl=train_control, method="naive_bayes")
+print(feature_NB_model)
+feature_NB_pred = predict(feature_NB_model, test_set)
+confusionMatrix(feature_NB_pred, as.factor(test_set$state), mode='prec_recall')
+
+
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+tf_NB_model<- train(state~., data=data_tf, trControl=train_control, method="naive_bayes")
+print(tf_NB_model)
+tf_NB_pred = predict(tf_NB_model, test_set_tf)
+confusionMatrix(tf_NB_pred, as.factor(test_set_tf$state), mode='prec_recall')
+
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+tfidf_NB_model<- train(state~., data=data_tfidf, trControl=train_control, method="naive_bayes")
+print(tfidf_NB_model)
+tfidf_NB_pred = predict(tfidf_NB_model, test_set_tfidf)
+confusionMatrix(tfidf_NB_pred, as.factor(test_set_tfidf$state), mode='prec_recall')
+
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+feature_tf_NB_model<- train(state~., data=feature_tf, trControl=train_control, method="naive_bayes")
+print(feature_tf_NB_model)
+feature_tf_NB_pred = predict(feature_tf_NB_model, feature_tf_test_set)
+confusionMatrix(feature_tf_NB_pred, as.factor(feature_tf_test_set$state), mode='prec_recall')
+
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+feature_tfidf_NB_model<- train(state~., data=feature_tfidf, trControl=train_control, method="naive_bayes")
+print(feature_tfidf_NB_model)
+feature_tfidf_NB_pred = predict(feature_tfidf_NB_model, feature_tfidf_test_set)
+confusionMatrix(feature_tfidf_NB_pred, as.factor(feature_tfidf_test_set$state), mode='prec_recall')
+```
+
+## Random Forest
+```{R}
+randomforest <- randomForest(state ~ ., data = train_set, importance=T, proximity = T, do.trace = 100)
+randomforest_tf <- randomForest(state ~ ., data = train_set_tf, importance=T, proximity = T, do.trace = 100)
+randomforest_tfidf <- randomForest(state ~ ., data = train_set_tfidf, importance=T, proximity = T, do.trace = 100)
+randomforest_feature_tf <- randomForest(state ~ ., data = feature_tf_train_set, importance=T, proximity = T, do.trace = 100)
+randomforest_feature_tfidf <- randomForest(state ~ ., data = feature_tfidf_train_set, importance=T, proximity = T, do.trace = 100)
+```
+
+```{r}
+predict_labels <- predict(randomforest, test_set, type = 'class')
+table_matrix <- confusionMatrix(predict_labels, test_set$state, mode='prec_recall')
+table_matrix
+
+predict_labels_tf <- predict(randomforest_tf, test_set_tf, type = 'class')
+table_matrix_tf <- confusionMatrix(predict_labels_tf, test_set_tf$state, mode='prec_recall')
+table_matrix_tf
+
+predict_labels_tfidf <- predict(randomforest_tfidf, test_set_tfidf, type = 'class')
+table_matrix_tfidf <- confusionMatrix(predict_labels_tfidf, test_set_tfidf$state, mode='prec_recall')
+table_matrix_tfidf
+
+predict_labels_feature_tf <- predict(randomforest_feature_tf, feature_tf_test_set, type = 'class')
+table_matrix_feature_tf <- confusionMatrix(predict_labels_feature_tf, feature_tf_test_set$state, mode='prec_recall')
+table_matrix_feature_tf
+
+predict_labels_feature_tfidf <- predict(randomforest_feature_tfidf, feature_tfidf_test_set, type = 'class')
+table_matrix_feature_tfidf <- confusionMatrix(predict_labels_feature_tfidf, feature_tfidf_test_set$state, mode='prec_recall')
+table_matrix_feature_tfidf
+```
+
+## Random Forest 10-fold Cross Validation
+```{r}
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+feature_RF_model<- train(state~., data=feature, trControl=train_control, method="cforest")
+print(feature_RF_model)
+feature_RF_pred = predict(feature_RF_model, test_set)
+confusionMatrix(feature_RF_pred, as.factor(test_set$state), mode='prec_recall')
+feature_RF_Im = varImp(feature_RF_model)
+
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+tf_RF_model<- train(state~., data=data_tf, trControl=train_control, method="cforest")
+print(tf_RF_model)
+tf_RF_pred = predict(tf_RF_model, test_set_tf)
+confusionMatrix(tf_RF_pred, as.factor(test_set_tf$state), mode='prec_recall')
+tf_RF_Im = varImp(tf_RF_model)
+
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+tfidf_RF_model<- train(state~., data=data_tfidf, trControl=train_control, method="cforest")
+print(tfidf_RF_model)
+tfidf_RF_pred = predict(tfidf_RF_model, test_set_tfidf)
+confusionMatrix(tfidf_RF_pred, as.factor(test_set_tfidf$state), mode='prec_recall')
+tfidf_RF_Im = varImp(tfidf_RF_model)
+
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+feature_tf_RF_model<- train(state~., data=feature_tf, trControl=train_control, method="cforest")
+print(feature_tf_RF_model)
+feature_tf_RF_pred = predict(feature_tf_RF_model, feature_tf_test_set)
+confusionMatrix(feature_tf_RF_pred, as.factor(feature_tf_test_set$state), mode='prec_recall')
+feature_tf_RF_Im = varImp(feature_tf_RF_model)
+
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+feature_tfidf_RF_model<- train(state~., data=feature_tfidf, trControl=train_control, method="cforest")
+print(feature_tfidf_RF_model)
+feature_tfidf_RF_pred = predict(feature_tfidf_RF_model, feature_tfidf_test_set)
+confusionMatrix(feature_tfidf_RF_pred, as.factor(feature_tfidf_test_set$state), mode='prec_recall')
+feature_tfidf_RF_Im = varImp(feature_tfidf_RF_model)
+```
+
+## SVM
+```{r}
+feature = labeler(feature)
+train_set_label = feature$label[trainIndex]
+test_set_label = feature$label[-trainIndex]
+train_set = subset(labeler(train_set), select = -c(state, environmentalCommitments, label))
+test_set = subset(labeler(test_set), select = -c(state, environmentalCommitments, label))
+
+data_tf = labeler(data_tf)
+train_set_tf_label = data_tf$label[trainIndex_tf]
+test_set_tf_label = data_tf$label[-trainIndex_tf]
+train_set_tf = subset(labeler(train_set_tf), select = -c(state, environmentalCommitments, label))
+test_set_tf = subset(labeler(test_set_tf), select = -c(state, environmentalCommitments, label))
+
+data_tfidf = labeler(data_tfidf)
+train_set_tfidf_label = data_tfidf$label[trainIndex_tfidf]
+test_set_tfidf_label = data_tfidf$label[-trainIndex_tfidf]
+train_set_tfidf = subset(labeler(train_set_tfidf), select = -c(state, environmentalCommitments, label))
+test_set_tfidf = subset(labeler(test_set_tfidf), select = -c(state, environmentalCommitments, label))
+
+feature_tf = labeler(feature_tf)
+feature_tf_train_set_label = feature_tf$label[feature_tf_trainIndex]
+feature_tf_test_set_label = feature_tf$label[-feature_tf_trainIndex]
+feature_tf_train_set = subset(labeler(feature_tf_train_set), select = -c(state, environmentalCommitments, label))
+feature_tf_test_set = subset(labeler(feature_tf_test_set), select = -c(state, environmentalCommitments, label))
+
+feature_tfidf = labeler(feature_tfidf)
+feature_tfidf_train_set_label = feature_tfidf$label[feature_tfidf_trainIndex]
+feature_tfidf_test_set_label = feature_tfidf$label[-feature_tfidf_trainIndex]
+feature_tfidf_train_set = subset(labeler(feature_tfidf_train_set), select = -c(state, environmentalCommitments, label))
+feature_tfidf_test_set = subset(labeler(feature_tfidf_test_set), select = -c(state, environmentalCommitments, label))
+```
+
+```{r}
+feature_SVM = svm(x = train_set, y = as.factor(train_set_label))
+feature_SVM_pred = predict(feature_SVM, test_set)
+confusionMatrix(feature_SVM_pred, as.factor(test_set_label), mode='prec_recall')
+
+tf_SVM = svm(x = train_set_tf, y = as.factor(train_set_tf_label))
+tf_SVM_pred = predict(tf_SVM, test_set_tf)
+confusionMatrix(tf_SVM_pred, as.factor(test_set_tf_label), mode='prec_recall')
+
+tfidf_SVM = svm(x = train_set_tfidf, y = as.factor(train_set_tfidf_label))
+tfidf_SVM_pred = predict(tfidf_SVM, test_set_tfidf)
+confusionMatrix(tfidf_SVM_pred, as.factor(test_set_tfidf_label), mode='prec_recall')
+
+feature_tf_SVM = svm(x = feature_tf_train_set, y = as.factor(feature_tf_train_set_label))
+feature_tf_SVM_pred = predict(feature_tf_SVM, feature_tf_test_set)
+confusionMatrix(feature_tf_SVM_pred, as.factor(feature_tf_test_set_label), mode='prec_recall')
+
+feature_tfidf_SVM = svm(x = feature_tfidf_train_set, y = as.factor(feature_tfidf_train_set_label))
+feature_tfidf_SVM_pred = predict(feature_tfidf_SVM, feature_tfidf_test_set)
+confusionMatrix(feature_tfidf_SVM_pred, as.factor(feature_tfidf_test_set_label), mode='prec_recall')
+```
+
+```{r}
+feature = subset(feature, select = -c(state, environmentalCommitments))
+feature$label  = as.factor(feature$label)
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+feature_svm_model<- train(label~., data=feature, trControl=train_control, method="svmLinearWeights2")
+print(feature_svm_model)
+feature_svm_pred = predict(feature_svm_model, test_set)
+confusionMatrix(feature_svm_pred, as.factor(test_set_label), mode='prec_recall')
+feature_svm_Im = varImp(feature_svm_model)
+
+data_tf = subset(data_tf, select = -c(state, environmentalCommitments))
+data_tf$label  = as.factor(data_tf$label)
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+tf_svm_model<- train(label~., data=data_tf, trControl=train_control, method="svmLinearWeights2")
+print(tf_svm_model)
+tf_svm_pred = predict(tf_svm_model, test_set_tf)
+confusionMatrix(tf_svm_pred, as.factor(test_set_tf_label), mode='prec_recall')
+tf_svm_Im = varImp(tf_svm_model)
+
+data_tfidf = subset(data_tfidf, select = -c(state, environmentalCommitments))
+data_tfidf$label  = as.factor(data_tfidf$label)
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+tfidf_svm_model<- train(label~., data=data_tfidf, trControl=train_control, method="svmLinearWeights2")
+print(tfidf_svm_model)
+tfidf_svm_pred = predict(tfidf_svm_model, test_set_tfidf)
+confusionMatrix(tfidf_svm_pred, as.factor(test_set_tfidf_label), mode='prec_recall')
+tfidf_svm_Im = varImp(tfidf_svm_model)
+
+feature_tf = subset(feature_tf, select = -c(state, environmentalCommitments))
+feature_tf$label  = as.factor(feature_tf$label)
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+feature_tf_svm_model<- train(label~., data=feature_tf, trControl=train_control, method="svmLinearWeights2")
+print(feature_tf_svm_model)
+feature_tf_svm_pred = predict(feature_tf_svm_model, feature_tf_test_set)
+confusionMatrix(feature_tf_svm_pred, as.factor(feature_tf_test_set_label), mode='prec_recall')
+feature_tf_svm_Im = varImp(feature_tf_svm_model)
+
+feature_tfidf = subset(feature_tfidf, select = -c(state, environmentalCommitments))
+feature_tfidf$label  = as.factor(feature_tfidf$label)
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+feature_tfidf_svm_model<- train(label~., data=feature_tfidf, trControl=train_control, method="svmLinearWeights2")
+print(feature_tfidf_svm_model)
+feature_tfidf_svm_pred = predict(feature_tfidf_svm_model, feature_tfidf_test_set)
+confusionMatrix(feature_tfidf_svm_pred, as.factor(feature_tfidf_test_set_label), mode='prec_recall')
+feature_tfidf_svm_Im = varImp(feature_tfidf_svm_model)
+```
+
+## Logistic regression
+```{r}
+assigner <- function(prediction){
+  pred_class = c()
+  for (i in seq_along(prediction)){
+    if(prediction[i]>0.5){
+      pred_class[i] <- 1
+    }else{
+      pred_class[i] <- 0
+    }
+  }
+  return(pred_class)
+}
+```
+
+```{r}
+NFOLD = 10 # 10 folds validation was used
+train_set = subset(train_set, select = -c(label_env)) # 刪除為給羅吉斯回歸的類別資料，減少雜訊
+test_set = subset(test_set, select = -c(label_env))
+glmnet_classifier = cv.glmnet(x = as.matrix(train_set), y = train_set_label, 
+                              family = 'binomial', 
+                              # L1 penalty
+                              alpha = 1,
+                              # interested in the area under ROC curve
+                              type.measure = "auc",
+                              # 5-fold cross-validation
+                              nfolds = NFOLD,
+                              # high value is less accurate, but has faster training
+                              thresh = 1e-3,
+                              # again lower number of iterations for faster training
+                              maxit = 1e3)
+train_set_tf = subset(train_set_tf, select = -c(label_env)) # 刪除為給羅吉斯回歸的類別資料，減少雜訊
+test_set_tf = subset(test_set_tf, select = -c(label_env)) # 刪除為給羅吉斯回歸的類別資料，減少雜訊
+glmnet_classifier_tf = cv.glmnet(x = as.matrix(train_set_tf), y = train_set_tf_label, 
+                              family = 'binomial', 
+                              # L1 penalty
+                              alpha = 1,
+                              # interested in the area under ROC curve
+                              type.measure = "auc",
+                              # 5-fold cross-validation
+                              nfolds = NFOLD,
+                              # high value is less accurate, but has faster training
+                              thresh = 1e-3,
+                              # again lower number of iterations for faster training
+                              maxit = 1e3)
+train_set_tfidf = subset(train_set_tfidf, select = -c(label_env)) # 刪除為給羅吉斯回歸的類別資料，減少雜訊
+test_set_tfidf = subset(test_set_tfidf, select = -c(label_env)) # 刪除為給羅吉斯回歸的類別資料，減少雜訊
+glmnet_classifier_tfidf = cv.glmnet(x = as.matrix(train_set_tfidf), y = train_set_tfidf_label, 
+                              family = 'binomial', 
+                              # L1 penalty
+                              alpha = 1,
+                              # interested in the area under ROC curve
+                              type.measure = "auc",
+                              # 5-fold cross-validation
+                              nfolds = NFOLD,
+                              # high value is less accurate, but has faster training
+                              thresh = 1e-3,
+                              # again lower number of iterations for faster training
+                              maxit = 1e3)
+
+feature_tf_train_set = subset(feature_tf_train_set, select = -c(label_env)) # 刪除為給羅吉斯回歸的類別資料，減少雜訊
+feature_tf_test_set = subset(feature_tf_test_set, select = -c(label_env)) # 刪除為給羅吉斯回歸的類別資料，減少雜訊
+glmnet_classifier_feature_tf = cv.glmnet(x = as.matrix(feature_tf_train_set), y = feature_tf_train_set_label, 
+                              family = 'binomial', 
+                              # L1 penalty
+                              alpha = 1,
+                              # interested in the area under ROC curve
+                              type.measure = "auc",
+                              # 5-fold cross-validation
+                              nfolds = NFOLD,
+                              # high value is less accurate, but has faster training
+                              thresh = 1e-3,
+                              # again lower number of iterations for faster training
+                              maxit = 1e3)
+
+feature_tfidf_train_set = subset(feature_tfidf_train_set, select = -c(label_env)) # 刪除為給羅吉斯回歸的類別資料，減少雜訊
+feature_tfidf_test_set = subset(feature_tfidf_test_set, select = -c(label_env)) # 刪除為給羅吉斯回歸的類別資料，減少雜訊
+glmnet_classifier_feature_tfidf = cv.glmnet(x = as.matrix(feature_tfidf_train_set), y = feature_tfidf_train_set_label, 
+                              family = 'binomial', 
+                              # L1 penalty
+                              alpha = 1,
+                              # interested in the area under ROC curve
+                              type.measure = "auc",
+                              # 5-fold cross-validation
+                              nfolds = NFOLD,
+                              # high value is less accurate, but has faster training
+                              thresh = 1e-3,
+                              # again lower number of iterations for faster training
+                              maxit = 1e3)
+```
+
+```{r}
+# the threshold with value 0.5 was used
+# logistic with only feature
+preds = predict(glmnet_classifier, as.matrix(test_set), type = 'response')[,1]
+confusionMatrix(as.factor(assigner(preds)), as.factor(test_set_label))
+#logistic with term frequency and feature
+preds_tf = predict(glmnet_classifier_tf, as.matrix(test_set_tf), type = 'response')[,1]
+confusionMatrix(as.factor(assigner(preds_tf)), as.factor(test_set_tf_label))
+
+#logistic with tfidf and feature
+preds_tfidf = predict(glmnet_classifier_tfidf, as.matrix(test_set_tfidf), type = 'response')[,1]
+confusionMatrix(as.factor(assigner(preds_tfidf)), as.factor(test_set_tfidf_label))
+
+#logistic with tf & tfidf and feature
+preds_feature_tf = predict(glmnet_classifier_feature_tf, as.matrix(feature_tf_test_set), type = 'response')[,1]
+confusionMatrix(as.factor(assigner(preds_feature_tf)), as.factor(feature_tf_test_set_label))
+
+preds_feature_tfidf = predict(glmnet_classifier_feature_tfidf, as.matrix(feature_tfidf_test_set), type = 'response')[,1]
+confusionMatrix(as.factor(assigner(preds_feature_tfidf)), as.factor(feature_tfidf_test_set_label))
+```
+
+```{r}
+glmnet:::auc(test_set_label, preds)
+glmnet:::auc(test_set_tf_label, preds_tf)
+glmnet:::auc(test_set_tfidf_label, preds_tfidf)
+glmnet:::auc(feature_tf_test_set_label, preds_feature_tf)
+glmnet:::auc(feature_tfidf_test_set_label, preds_feature_tfidf)
+```
